@@ -111,6 +111,11 @@ services:
     build:
       context: ./hms
       dockerfile: Dockerfile
+      network: host
+      args:
+        - http_proxy=${http_proxy:-}
+        - https_proxy=${https_proxy:-}
+        - no_proxy=${no_proxy:-}
     platform: ${DOCKER_DEFAULT_PLATFORM:-linux/amd64}
     depends_on:
       minio:
@@ -122,6 +127,9 @@ services:
     environment:
       SERVICE_NAME: "metastore"
       SERVICE_OPTS: "-Dmetastore.warehouse.dir=s3a://warehouse/hive/"
+      http_proxy: ""
+      https_proxy: ""
+      no_proxy: ""
     healthcheck:
       test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9083"]
       interval: 5s
@@ -165,6 +173,11 @@ services:
     build:
       context: ./spark
       dockerfile: Dockerfile
+      network: host
+      args:
+        - http_proxy=${http_proxy:-}
+        - https_proxy=${https_proxy:-}
+        - no_proxy=${no_proxy:-}
     networks:
       iceberg_test:
     depends_on:
@@ -191,19 +204,25 @@ services:
     image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
     networks:
       iceberg_test:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       spark-iceberg:
         condition: service_healthy
+    environment:
+      - http_proxy=http://host.docker.internal:3128
+      - https_proxy=http://host.docker.internal:3128
+      - no_proxy=spark-iceberg,minio,rest,hive-metastore,localhost,127.0.0.1
     entrypoint: ["/bin/sh", "-c", "uv run /opt/spark/provision.py && touch /tmp/provision_complete && tail -f /dev/null"]
     volumes:
       - ./spark/provision.py:/opt/spark/provision.py:ro
       - uv-cache:/root/.cache/uv
     healthcheck:
       test: ["CMD-SHELL", "[ -f /tmp/provision_complete ]"]
-      interval: 2s
+      interval: 5s
       timeout: 2s
-      retries: 90
-      start_period: 20s
+      retries: 120
+      start_period: 60s
 
 volumes:
   uv-cache:
