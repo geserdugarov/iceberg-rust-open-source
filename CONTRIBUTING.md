@@ -108,7 +108,15 @@ Currently, iceberg-rust uses Docker to set up environment for integration tests.
 * To compile the project: `make build`
 * To check code styles: `make check`
 * To run unit tests only: `make unit-test`
-* To run all tests: `make test`
+* To run all tests:
+```bash
+export http_proxy=http://your-proxy:port && \
+  export https_proxy=http://your-proxy:port && \
+  export no_proxy=localhost,127.0.0.1 && \
+  make docker-down && \
+  docker volume prune -f && \
+  make test
+```
 
 ## Dependencies
 
