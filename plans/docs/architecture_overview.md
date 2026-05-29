@@ -23,8 +23,8 @@ This document provides a high-level architecture overview of the Apache Iceberg 
 │   ┌─────────────────────┐  ┌──────────────────────────────────┐     │
 │   │ iceberg-datafusion  │  │ iceberg-cache-moka               │     │
 │   │ (IcebergTableScan,  │  │ (metadata caching)               │     │
-│   │  IcebergTableWrite, │  │                                  │     │
-│   │  IcebergTableCommit,│  │                                  │     │
+│   │  IcebergWriteExec,  │  │                                  │     │
+│   │  IcebergCommitExec, │  │                                  │     │
 │   │  TaskWriter)        │  │                                  │     │
 │   └─────────┬───────────┘  └──────────────┬───────────────────┘     │
 │             │                             │                         │
@@ -115,7 +115,7 @@ iceberg-rust/
 │   ├── integrations/
 │   │   ├── datafusion/             DataFusion query engine integration
 │   │   │   └── src/
-│   │   │       ├── physical_plan/  IcebergTableScan, IcebergTableWrite, IcebergTableCommit
+│   │   │       ├── physical_plan/  IcebergTableScan, IcebergWriteExec, IcebergCommitExec
 │   │   │       ├── task_writer.rs  High-level writer with partition dispatch
 │   │   │       └── ...             Table provider, catalog provider
 │   │   ├── cache-moka/             Moka-based metadata caching layer
@@ -434,7 +434,7 @@ Rust types (crates/iceberg/src/spec/):
 └───────────┼───────────────────────────────┼──────────────────────────┘
             │                               │
   ┌─────────V──────────┐         ┌──────────V───────────┐
-  │ IcebergTableScan   │         │ IcebergTableWrite     │
+  │ IcebergTableScan   │         │ IcebergWriteExec      │
   │ (ExecutionPlan)    │         │ (ExecutionPlan)       │
   │                    │         │                       │
   │ execute():         │         │ execute():            │
@@ -445,7 +445,7 @@ Rust types (crates/iceberg/src/spec/):
   │  → RecordBatch     │         └──────────┬────────────┘
   │    Stream          │                    │
   └────────────────────┘         ┌──────────V────────────┐
-                                 │ IcebergTableCommit    │
+                                 │ IcebergCommitExec     │
                                  │ (ExecutionPlan)       │
                                  │                       │
                                  │ execute():            │

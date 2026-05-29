@@ -72,7 +72,7 @@ This means: If position delete files or DVs were written by another system
 EqualityDeleteFileWriter                            [iceberg/src/writer/base_writer/equality_delete_writer.rs]
   │
   └─> Can write equality delete files (Parquet format)
-      with field validation (no floats, no nullable)
+      with field validation (no floats, no nested types)
 
   This is the only delete write capability currently available.
 ```
@@ -83,7 +83,7 @@ EqualityDeleteFileWriter                            [iceberg/src/writer/base_wri
 IcebergTableProvider                                [integrations/datafusion/src/table/mod.rs]
   │
   ├─> scan() → IcebergTableScan          read operations (IMPLEMENTED)
-  ├─> insert_into() → IcebergTableWrite   append operations (IMPLEMENTED)
+  ├─> insert_into() → IcebergWriteExec    append operations (IMPLEMENTED)
   │
   └─> Row-level operations (UPDATE, DELETE, MERGE):
         NOT IMPLEMENTED
