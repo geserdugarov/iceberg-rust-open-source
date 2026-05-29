@@ -23,8 +23,12 @@ This document traces the complete write path from Arrow RecordBatch data to Parq
                     │       V               │
                     │  DataFileWriter       │
                     │  (wraps Rolling-      │
-                    │   FileWriter wraps    │
-                    │   ParquetWriter)      │
+                    │   FileWriter; each    │
+                    │   rolled file built   │
+                    │   from a FileWriter-  │
+                    │   Builder, e.g.       │
+                    │   ParquetWriterBuilder│
+                    │   → ParquetWriter)    │
                     └───────────┬───────────┘
                                 │
                     ┌───────────V───────────┐
@@ -88,11 +92,17 @@ This document traces the complete write path from Arrow RecordBatch data to Parq
 
 ### Phase 1: Writer Traits
 
+Two layers of traits cooperate. `IcebergWriter` / `IcebergWriterBuilder` are the
+logical, user-facing writers (data file, equality-delete file, partitioning
+wrappers). `FileWriter` / `FileWriterBuilder` are the inner physical
+file-format writers (Parquet today) used internally by the rolling writer.
+
 ```
-Traits defined in crates/iceberg/src/writer/mod.rs:
+Logical traits defined in crates/iceberg/src/writer/mod.rs:
 
 IcebergWriterBuilder<I, O>                          [writer/mod.rs]
   │  type R: IcebergWriter<I, O>
+  │  (I = RecordBatch, O = Vec<DataFile> by default)
   │
   └─> async fn build(
         &self,
@@ -111,49 +121,74 @@ CurrentFileStatus                                    [writer/mod.rs]
   ├─> fn current_file_path() → String
   ├─> fn current_row_num() → usize
   └─> fn current_written_size() → usize
+
+Physical traits defined in crates/iceberg/src/writer/file_writer/mod.rs:
+
+FileWriterBuilder<O = Vec<DataFileBuilder>>          [file_writer/mod.rs]
+  │  type R: FileWriter<O>
+  │
+  └─> async fn build(&self, output_file: OutputFile) → Result<Self::R>
+
+FileWriter<O = Vec<DataFileBuilder>>                 [file_writer/mod.rs]
+  │  : Send + CurrentFileStatus + 'static
+  │
+  ├─> async fn write(&mut self, batch: &RecordBatch) → Result<()>
+  └─> async fn close(self) → Result<O>   (consumes self)
 ```
 
 ### Phase 2: File-Level Writing (Parquet)
 
 ```
 ParquetWriterBuilder                                [writer/file_writer/parquet_writer.rs]
+  │  Implements FileWriterBuilder<R = ParquetWriter>
   │
-  ├─> new(WriterProperties, arrow SchemaRef)
+  ├─> new(WriterProperties, iceberg SchemaRef)
+  │     defaults FieldMatchMode::Id
   │
-  ├─> build_v1(file_io, location, file_name) → ParquetWriter
-  ├─> build_v2_data(...) → ParquetWriter
-  └─> build_v3_data(...) → ParquetWriter
+  ├─> new_with_match_mode(WriterProperties, SchemaRef, FieldMatchMode)
+  │
+  └─> async fn build(&self, output_file: OutputFile) → ParquetWriter
         │
         └─> ParquetWriter {
-              AsyncArrowWriter (parquet crate),
-              out: OutputFileWrite,
+              schema: SchemaRef,
+              output_file: OutputFile,
+              inner_writer: Option<AsyncArrowWriter<…>>,  // lazy
+              writer_properties: WriterProperties,
               current_row_num: usize,
-              written_size: usize,
+              nan_value_count_visitor: NanValueCountVisitor,
             }
 
 ParquetWriter                                       [writer/file_writer/parquet_writer.rs]
   │
-  ├─> write(RecordBatch):
-  │     ├─> async_arrow_writer.write(&batch)
+  ├─> write(&RecordBatch):
+  │     ├─> skip if batch is empty
   │     ├─> current_row_num += batch.num_rows()
-  │     └─> written_size = async_arrow_writer.in_progress_size()
+  │     ├─> nan_value_count_visitor.compute(schema, batch)
+  │     ├─> Lazily initialize AsyncArrowWriter on first non-empty batch
+  │     └─> async_arrow_writer.write(&batch)
   │
-  └─> close() → DataFileBuilder:
-        ├─> async_arrow_writer.close()
+  ├─> current_written_size():
+  │     bytes_written + in_progress_size of the AsyncArrowWriter
+  │     (used by RollingFileWriter to decide rollover)
+  │
+  └─> close(self) → Vec<DataFileBuilder>:
+        ├─> async_arrow_writer.finish()
         │     └─> flushes remaining rows
         │     └─> writes Parquet footer
-        ├─> Collect column statistics:
-        │     min/max values (from Parquet metadata)
-        │     null value counts
-        │     NaN value counts (NanValueCountVisitor)
-        │     column sizes
-        ├─> Compute file size from output stream
-        └─> Return DataFileBuilder with:
-              file_path, file_format=Parquet,
-              record_count, file_size_in_bytes,
-              column_sizes, value_counts,
+        ├─> If current_row_num == 0: delete the output file, return []
+        ├─> Else, collect column statistics from Parquet metadata via
+        │     parquet_to_data_file_builder():
+        │       lower/upper bounds (MinMaxColAggregator)
+        │       column sizes, value counts, null value counts
+        │       nan value counts (NanValueCountVisitor)
+        │       record_count, file_size_in_bytes, split_offsets
+        └─> Return Vec with one DataFileBuilder pre-populated with:
+              file_path, file_format=Parquet, record_count,
+              file_size_in_bytes, column_sizes, value_counts,
               null_value_counts, nan_value_counts,
-              lower_bounds, upper_bounds
+              lower_bounds, upper_bounds, split_offsets
+              (content type and partition are filled in by the wrapping
+               base writer — see Phase 5)
 ```
 
 ### Phase 3: Rolling File Writer
@@ -164,23 +199,35 @@ RollingFileWriterBuilder<B, L, F>                   [writer/file_writer/rolling_
   │  L: LocationGenerator
   │  F: FileNameGenerator
   │
-  └─> build(partition_key) → RollingFileWriter
+  ├─> new(inner_builder, target_file_size,
+  │       file_io, location_generator, file_name_generator)
+  │
+  ├─> new_with_default_file_size(inner_builder,
+  │       file_io, location_generator, file_name_generator)
+  │       target = TableProperties::
+  │                  PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT
+  │
+  └─> build() → RollingFileWriter
+        (no partition argument — partition is supplied on each write)
 
 RollingFileWriter<B, L, F>                          [writer/file_writer/rolling_writer.rs]
   │
-  ├─> write(RecordBatch):
-  │     ├─> if current_writer.is_none()
-  │     │     OR current_writer.written_size >= target_file_size:
-  │     │       close current writer → collect DataFileBuilder
-  │     │       open new writer:
-  │     │         location = L.generate_location(partition)
-  │     │         file_name = F.generate_file_name()
-  │     │         writer = B.build(file_io, location, file_name)
+  ├─> write(partition_key: &Option<PartitionKey>, &RecordBatch):
+  │     ├─> if inner is None:
+  │     │     open inner writer via new_output_file(partition_key):
+  │     │       loc = L.generate_location(partition_key.as_ref(),
+  │     │                                 &F.generate_file_name())
+  │     │       inner = B.build(file_io.new_output(loc))
   │     │
-  │     └─> current_writer.write(batch)
+  │     ├─> if should_roll() (current_written_size() > target_file_size):
+  │     │     data_file_builders.extend(inner.take().close())
+  │     │     open a fresh inner writer (same recipe as above)
+  │     │
+  │     └─> inner.write(batch)
   │
-  └─> close() → Vec<DataFileBuilder>:
-        close current writer, return all accumulated DataFileBuilders
+  └─> close(self) → Vec<DataFileBuilder>:
+        ├─> if inner is Some: data_file_builders.extend(inner.close())
+        └─> return all accumulated DataFileBuilders
 
 Target file size: from table properties
   (write.target-file-size-bytes, default 512 MB)
@@ -190,76 +237,94 @@ Target file size: from table properties
 
 ```
 DefaultLocationGenerator                            [writer/file_writer/location_generator.rs]
+  │  Source: table.location() + properties
+  │           ("write.data.path" or "write.folder-storage.path";
+  │            falling back to "<location>/data")
   │
-  └─> generate_location(partition_key):
-        table_location / data / partition_path
-        e.g. "s3://bucket/table/data/date=2024-01-01/"
+  └─> generate_location(partition_key: Option<&PartitionKey>, file_name: &str)
+        unpartitioned: "{data_location}/{file_name}"
+        partitioned:   "{data_location}/{partition_path}/{file_name}"
 
 DefaultFileNameGenerator                            [writer/file_writer/location_generator.rs]
+  │  fields: prefix, suffix, format, file_count: AtomicU64
   │
   └─> generate_file_name():
-        {prefix}-{uuid}-{sequence}.{format}
-        e.g. "00000-0-a1b2c3d4-e5f6-7890-abcd-ef1234567890.parquet"
+        "{prefix}-{file_count:05}[-{suffix}].{format}"
+        e.g. "01900b34-7e0e-7e6b-a26d-2ca345b9d3c1-00000.parquet"
+        (DataFusion uses Uuid::now_v7() as the prefix per writer instance —
+         see crates/integrations/datafusion/src/physical_plan/write.rs)
 ```
 
 ### Phase 5: Base Writers (Data Files & Delete Files)
 
 ```
 DataFileWriter<B, L, F>                             [writer/base_writer/data_file_writer.rs]
-  │  Wraps RollingFileWriter
+  │  Wraps RollingFileWriter + remembered Option<PartitionKey>
+  │
+  ├─> DataFileWriterBuilder::new(RollingFileWriterBuilder)
+  ├─> IcebergWriterBuilder.build(partition_key) →
+  │     DataFileWriter { inner: rolling_builder.build(), partition_key }
   │
   ├─> IcebergWriter.write(RecordBatch):
-  │     └─> rolling_writer.write(batch)
+  │     └─> rolling.write(&partition_key, &batch)
   │
   └─> IcebergWriter.close() → Vec<DataFile>:
-        ├─> rolling_writer.close() → Vec<DataFileBuilder>
+        ├─> rolling.close() → Vec<DataFileBuilder>
         └─> for each builder:
               builder
                 .content(DataContentType::Data)
-                .partition(partition_key)
+                .partition(pk.data().clone())               // if Some(pk)
+                .partition_spec_id(pk.spec().spec_id())     // if Some(pk)
                 .build() → DataFile
 
 EqualityDeleteFileWriter<B, L, F>                   [writer/base_writer/equality_delete_writer.rs]
   │  Wraps RollingFileWriter + RecordBatchProjector
   │
-  ├─> EqualityDeleteWriterConfig.new(equality_ids, schema):
-  │     Validates:
-  │       - equality fields must be primitive types
-  │       - no floating point types allowed
-  │       - fields must not be nullable
-  │     Creates RecordBatchProjector for equality columns
+  ├─> EqualityDeleteWriterConfig::new(equality_ids, schema):
+  │     Builds a RecordBatchProjector for equality columns.
+  │     Identifier rules (per Iceberg spec):
+  │       - nested types are rejected (mapped to None)
+  │       - floating point types are rejected (mapped to None)
   │
   ├─> IcebergWriter.write(RecordBatch):
-  │     ├─> projector.project(batch) → projected batch
-  │     └─> rolling_writer.write(projected_batch)
+  │     ├─> projector.project_batch(batch) → projected batch
+  │     └─> rolling.write(&partition_key, &projected)
   │
   └─> IcebergWriter.close() → Vec<DataFile>:
-        ├─> rolling_writer.close() → Vec<DataFileBuilder>
+        ├─> rolling.close() → Vec<DataFileBuilder>
         └─> for each builder:
               builder
                 .content(DataContentType::EqualityDeletes)
-                .equality_ids(equality_ids)
-                .partition(partition_key)
+                .equality_ids(Some(equality_ids))
+                .partition(pk.data().clone())               // if Some(pk)
+                .partition_spec_id(pk.spec().spec_id())     // if Some(pk)
                 .build() → DataFile
 ```
+
+There is no position-delete writer yet; only data files and equality-delete files have
+base writers in the current codebase.
 
 ### Phase 6: Partitioning Writers
 
 ```
+PartitioningWriter trait                            [writer/partitioning/mod.rs]
+  ├─> async fn write(&mut self, PartitionKey, I) → Result<()>
+  └─> async fn close(self) → Result<O>
+
 ┌─────────────────────────────────────────────────────────────────┐
 │ Partitioning Strategy Selection                                 │
 │                                                                 │
 │  ┌───────────────────────┐                                      │
 │  │ UnpartitionedWriter   │  For tables without partition spec   │
-│  │                       │  Single inner writer instance        │
-│  │ write(batch):         │  Pass-through to inner writer        │
-│  │   inner.write(batch)  │                                      │
-│  └───────────────────────┘                                      │
+│  │                       │  Lazily builds one inner writer      │
+│  │ write(batch):         │  (does NOT implement                 │
+│  │   inner.write(batch)  │   PartitioningWriter — its           │
+│  └───────────────────────┘   write(batch) takes no key)         │
 │                                                                 │
 │  ┌───────────────────────┐                                      │
 │  │ FanoutWriter          │  For unsorted/interleaved data       │
-│  │                       │  One writer per partition (HashMap)  │
-│  │ write(key, batch):    │                                      │
+│  │                       │  One writer per partition (HashMap   │
+│  │ write(key, batch):    │   keyed by Struct = partition data)  │
 │  │   writers[key]        │  Routes batch to partition writer    │
 │  │     .write(batch)     │  Creates writer on first access      │
 │  └───────────────────────┘                                      │
@@ -267,87 +332,188 @@ EqualityDeleteFileWriter<B, L, F>                   [writer/base_writer/equality
 │  ┌───────────────────────┐                                      │
 │  │ ClusteredWriter       │  For pre-sorted data                 │
 │  │                       │  Single active writer at a time      │
-│  │ write(key, batch):    │                                      │
-│  │   if key != current:  │  Closes old writer on partition      │
-│  │     close old writer  │  change → more memory efficient      │
-│  │     open new writer   │                                      │
-│  │   writer.write(batch) │                                      │
+│  │ write(key, batch):    │  On partition change, closes prior   │
+│  │   if key != current:  │  writer and records the partition    │
+│  │     close old writer  │  as "closed". Writing to a closed    │
+│  │     open new writer   │  partition errors → input must be    │
+│  │   writer.write(batch) │  sorted by partition key.            │
 │  └───────────────────────┘                                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 7: DataFusion TaskWriter
+### Phase 7: DataFusion Write Path
+
+The DataFusion side starts in `IcebergTableProvider::insert_into`
+(`integrations/datafusion/src/table/mod.rs`), which assembles the physical plan
+that wraps the engine's input stream all the way through to the catalog
+commit. `IcebergStaticTableProvider::insert_into` always returns
+`FeatureUnsupported` — only the catalog-backed provider supports writes.
 
 ```
-TaskWriter<B>                                       [datafusion/src/task_writer.rs]
+IcebergTableProvider::insert_into(state, input, _insert_op)
+                                                    [datafusion/src/table/mod.rs]
   │
-  ├─> new(schema, partition_spec, table_location,
-  │       target_file_size, writer_builder, fanout_enabled):
+  ├─> Load fresh table metadata from the catalog:
+  │     table = catalog.load_table(&self.table_ident).await?
+  │
+  ├─> Step 1: Project partition values (partitioned tables only)
+  │     plan = project_with_partition(input, &table)
+  │            [physical_plan/project.rs]
+  │     Adds the `_partition` struct column (PROJECTED_PARTITION_VALUE_COLUMN)
+  │     computed from each row via PartitionValueCalculator.
+  │     Returns input unchanged for unpartitioned tables.
+  │
+  ├─> Step 2: Repartition for parallel processing
+  │     plan = repartition(plan, table_metadata,
+  │                        target_partitions = state.config().target_partitions())
+  │            [physical_plan/repartition.rs]
+  │     - Identity / Bucket transforms → hash partitioning on `_partition`
+  │     - Temporal transforms (Year/Month/Day/Hour) → round-robin
+  │     - Unpartitioned tables → round-robin
+  │
+  ├─> Step 3: Optionally sort by partition
+  │     fanout_enabled = table_property("write.datafusion.fanout.enabled")
+  │                      .unwrap_or(true)
+  │     if !fanout_enabled:
+  │       plan = sort_by_partition(plan)   [physical_plan/sort.rs]
+  │              SortExec on `_partition`, preserve_partitioning = true
+  │     (Fanout enabled is the default → no sort node; TaskWriter then picks
+  │      FanoutWriter. Disabled → sorted input → TaskWriter picks
+  │      ClusteredWriter.)
+  │
+  ├─> Step 4: Wrap in IcebergWriteExec
+  │     plan = IcebergWriteExec::new(table, plan, arrow_schema)
+  │            [physical_plan/write.rs]
+  │     One write stream per input partition; each stream builds its own
+  │     TaskWriter (see below) and emits a one-column RecordBatch of
+  │     serialized DataFile JSON (column DATA_FILES_COL_NAME = "data_files").
+  │
+  ├─> Step 5: Wrap in CoalescePartitionsExec
+  │     plan = CoalescePartitionsExec::new(plan)
+  │     Merges all per-partition data-file streams into a single stream so
+  │     the commit can see every file in one place.
+  │
+  └─> Step 6: Wrap in IcebergCommitExec and return the final plan
+        plan = IcebergCommitExec::new(table, catalog, plan, arrow_schema)
+               [physical_plan/commit.rs]
+        Executes against partition 0 only:
+          - Reads the upstream "data_files" StringArray and
+            deserialize_data_file_from_json(...) → Vec<DataFile>
+          - tx = Transaction::new(&table)
+          - tx.fast_append().add_data_files(data_files).apply(tx)?
+                            .commit(catalog).await
+          - Emits one UInt64 "count" row with the total record count.
+
+Per-partition execution inside IcebergWriteExec::execute(partition):
+  ├─> Read table_properties; require write_format_default == Parquet
+  │     (other formats currently return FeatureUnsupported).
+  ├─> Build ParquetWriterBuilder with FieldMatchMode::Name and CDC options
+  │     derived from table props.
+  ├─> Build DefaultLocationGenerator / DefaultFileNameGenerator
+  │     (file name prefix = Uuid::now_v7().to_string()).
+  ├─> Wrap in RollingFileWriterBuilder(target = write_target_file_size_bytes)
+  │     → DataFileWriterBuilder.
+  ├─> TaskWriter::try_new(data_file_writer_builder, fanout_enabled,
+  │                       schema, partition_spec)
+  ├─> For each RecordBatch from the input stream:
+  │     task_writer.write(batch).await
+  ├─> data_files = task_writer.close().await
+  └─> Emit one RecordBatch: StringArray of
+        serialize_data_file_to_json(data_file, partition_type, format_version)
+
+TaskWriter<B>                                       [datafusion/src/task_writer.rs]
+  │  pub(crate) struct (internal to the datafusion integration)
+  │
+  ├─> try_new(
+  │       writer_builder: B,
+  │       fanout_enabled: bool,
+  │       schema: SchemaRef,
+  │       partition_spec: PartitionSpecRef,
+  │     ) → Result<Self>
   │     │
-  │     ├─> if unpartitioned:
-  │     │     → UnpartitionedWriter<B>
+  │     ├─> if partition_spec.is_unpartitioned():
+  │     │     → SupportedWriter::Unpartitioned(UnpartitionedWriter::new(b))
   │     │
   │     ├─> if partitioned && fanout_enabled:
-  │     │     → FanoutWriter<B>
+  │     │     → SupportedWriter::Fanout(FanoutWriter::new(b))
   │     │
   │     └─> if partitioned && !fanout_enabled:
-  │           → ClusteredWriter<B>
+  │           → SupportedWriter::Clustered(ClusteredWriter::new(b))
+  │     +
+  │     For partitioned tables, also builds a
+  │     RecordBatchPartitionSplitter (iceberg::arrow) using precomputed
+  │     partition values from the upstream `_partition` column.
   │
-  ├─> write(RecordBatch):
-  │     ├─> RecordBatchPartitionSplitter.split(batch)
-  │     │     → Vec<(PartitionKey, RecordBatch)>
-  │     │     Splits batch into sub-batches by partition key
-  │     │     using partition transforms (identity, bucket, truncate, etc.)
-  │     │
-  │     └─> for each (partition_key, sub_batch):
-  │           partitioning_writer.write(partition_key, sub_batch)
+  ├─> async fn write(&mut self, RecordBatch):
+  │     ├─> Unpartitioned: writer.write(batch)        (no split)
+  │     └─> Fanout / Clustered:
+  │           splitter.split(batch) → Vec<(PartitionKey, RecordBatch)>
+  │           for each (key, sub_batch):
+  │               writer.write(key, sub_batch)
   │
-  └─> close() → Vec<DataFile>
+  └─> async fn close(self) → Result<Vec<DataFile>>   (consumes self)
 ```
 
 ### Phase 8: Transaction & Commit
 
 ```
-Transaction::new(table)                             [iceberg/src/transaction/mod.rs]
+Transaction::new(table: &Table)                     [iceberg/src/transaction/mod.rs]
   │
-  ├─> Transaction { table, actions: vec![] }
+  ├─> Transaction { table: table.clone(), actions: vec![] }
   │
-  ├─> fast_append() → FastAppendAction             [transaction/append.rs]
+  ├─> fast_append() → FastAppendAction              [transaction/append.rs]
   │     │
-  │     ├─> add_data_files(Vec<DataFile>)
-  │     ├─> with_check_duplicate(bool)
+  │     ├─> add_data_files(impl IntoIterator<Item = DataFile>)
+  │     ├─> with_check_duplicate(bool)              (default true)
   │     ├─> set_commit_uuid(Uuid)
-  │     └─> set_snapshot_properties(HashMap)
+  │     ├─> set_key_metadata(Vec<u8>)
+  │     └─> set_snapshot_properties(HashMap<String, String>)
   │
-  ├─> Other available actions:
+  ├─> Other action constructors on Transaction:
   │     ├─> update_table_properties() → UpdatePropertiesAction
-  │     ├─> replace_sort_order() → ReplaceSortOrderAction
-  │     ├─> update_location() → UpdateLocationAction
-  │     ├─> update_statistics() → UpdateStatisticsAction
-  │     └─> upgrade_table_version() → UpgradeFormatVersionAction
+  │     ├─> update_schema()           → UpdateSchemaAction
+  │     ├─> replace_sort_order()      → ReplaceSortOrderAction
+  │     ├─> update_location()         → UpdateLocationAction
+  │     ├─> update_statistics()       → UpdateStatisticsAction
+  │     └─> upgrade_table_version()   → UpgradeFormatVersionAction
   │
-  └─> commit(catalog) → Result<Table>              [transaction/mod.rs]
+  ├─> Actions are attached via the ApplyTransactionAction trait:
+  │     let tx = action.apply(tx)?;
+  │     (pushes Arc<dyn TransactionAction> into tx.actions)
+  │
+  └─> commit(catalog: &dyn Catalog) → Result<Table>  [transaction/mod.rs]
         │
-        ├─> Retry loop with exponential backoff:
-        │     base: 100ms, max: 5s, max retries: 5
+        ├─> Empty actions → return original table unchanged
+        │
+        ├─> Build exponential backoff (backon::ExponentialBuilder)
+        │   from table properties (with documented defaults):
+        │     commit.retry.min-wait-ms     (default 100 ms)
+        │     commit.retry.max-wait-ms     (default 60 000 ms = 1 min)
+        │     commit.retry.total-timeout-ms(default 1 800 000 ms = 30 min)
+        │     commit.retry.num-retries     (default 4)
+        │   Retries while err.retryable() is true.
         │
         └─> do_commit():
               │
               ├─> Refresh table from catalog:
               │     catalog.load_table(table_ident)
+              │     If metadata or metadata_location changed,
+              │     re-base on the refreshed table.
               │
               ├─> For each action:
-              │     action.commit(&table) → ActionCommit {
+              │     action.commit(&current_table) → ActionCommit {
               │       updates: Vec<TableUpdate>,
               │       requirements: Vec<TableRequirement>,
               │     }
+              │     Apply updates locally to current_table so subsequent
+              │     actions see a consistent view.
               │
               ├─> Build TableCommit:
-              │     TableCommit {
-              │       ident: TableIdent,
-              │       requirements: all TableRequirements,
-              │       updates: all TableUpdates,
-              │     }
+              │     TableCommit::builder()
+              │       .ident(table_ident)
+              │       .requirements(all TableRequirements)
+              │       .updates(all TableUpdates)
+              │       .build()
               │
               └─> catalog.update_table(table_commit)
                     → Returns updated Table
@@ -358,58 +524,65 @@ Transaction::new(table)                             [iceberg/src/transaction/mod
 ```
 FastAppendAction.commit(table)                      [transaction/append.rs]
   │
-  ├─> Validate data files (schema, partition spec)
-  ├─> Optionally check for duplicate files
+  ├─> Build SnapshotProducer::new(table, commit_uuid, key_metadata,
+  │                               snapshot_properties, added_data_files)
+  ├─> validate_added_data_files()
+  │     - only DataContentType::Data allowed
+  │     - partition_spec_id must match table default
+  │     - partition values must match partition type
+  ├─> if check_duplicate: validate_duplicate_files()
+  └─> SnapshotProducer::commit(FastAppendOperation,
+                               DefaultManifestProcess)
+        → ActionCommit (TableUpdate::AddSnapshot, SetSnapshotRef, …)
+
+SnapshotProducer::commit()                          [transaction/snapshot.rs]
   │
-  └─> SnapshotProducer::produce_snapshot()          [transaction/snapshot.rs]
-        │
-        ├─> Generate snapshot_id (unique)
-        │
-        ├─> Write new manifest file:
-        │     ManifestWriter::new(output_file)      [spec/manifest/writer.rs]
-        │       │
-        │       ├─> For each added DataFile:
-        │       │     add_entry(ManifestEntry {
-        │       │       status: Added,
-        │       │       snapshot_id,
-        │       │       data_file,
-        │       │     })
-        │       │
-        │       ├─> Track statistics:
-        │       │     added_files_count++
-        │       │     added_rows_count += record_count
-        │       │     partition summaries (min/max)
-        │       │
-        │       └─> write_manifest_file()
-        │             └─> Serialize entries to Avro format
-        │             └─> Write to output file
-        │             └─> Return ManifestFile metadata
-        │
-        ├─> Collect all manifests:
-        │     ├─ New manifest (with added files)
-        │     └─ Existing manifests (carried forward from parent snapshot)
-        │
-        ├─> Write manifest list:
-        │     ManifestListWriter::new(output_file)  [spec/manifest_list.rs]
-        │       └─> Serialize all ManifestFile entries to Avro
-        │       └─> Return manifest list location
-        │
-        └─> Create new Snapshot:
-              Snapshot {
-                snapshot_id,
-                parent_snapshot_id,
-                sequence_number (incremented),
-                timestamp_ms,
-                operation: "append",
-                summary: {
-                  "added-data-files": N,
-                  "added-records": M,
-                  "total-data-files": X,
-                  "total-records": Y,
-                },
-                manifest_list: manifest_list_location,
-                schema_id,
-              }
+  ├─> Generate manifest list path:
+  │     "{table_location}/metadata/snap-{snapshot_id}-{attempt}-{commit_uuid}.avro"
+  │
+  ├─> Open ManifestListWriter (version-specific constructor):
+  │     ├─ FormatVersion::V1 → ManifestListWriter::v1(...)
+  │     ├─ FormatVersion::V2 → ManifestListWriter::v2(...)
+  │     └─ FormatVersion::V3 → ManifestListWriter::v3(..., first_row_id)
+  │     [spec/manifest_list.rs]
+  │
+  ├─> Write new manifest file with added entries:
+  │     write_added_manifest() → ManifestFile
+  │       │
+  │       ├─> Build per-version writer via ManifestWriterBuilder
+  │       │     (build_v1 / build_v2_data / build_v3_data, ...)
+  │       │     [spec/manifest/writer.rs]
+  │       │
+  │       ├─> For each added DataFile:
+  │       │     add_entry(ManifestEntry {
+  │       │       status: Added,
+  │       │       snapshot_id, (V1 only; inherited for V2/V3)
+  │       │       data_file,
+  │       │     })
+  │       │
+  │       └─> writer.write_manifest_file()
+  │             → Serialize entries to Avro and return ManifestFile metadata
+  │
+  ├─> Gather existing manifests from FastAppendOperation.existing_manifest():
+  │     load parent snapshot's manifest list, carry forward all entries
+  │     that have added or existing files.
+  │
+  ├─> manifest_list_writer.add_manifests(all_manifests).close()
+  │
+  ├─> Build Summary via SnapshotSummaryCollector:
+  │     Operation::Append
+  │     additional_properties:
+  │       added-data-files, added-records, added-files-size,
+  │       total-data-files, total-records, total-files-size, …
+  │     merged with snapshot_properties.
+  │
+  └─> Emit TableUpdates:
+        AddSnapshot { snapshot }, SetSnapshotRef { MAIN, snapshot_id }
+        Snapshot fields:
+          snapshot_id, parent_snapshot_id,
+          sequence_number (next_sequence_number from metadata),
+          timestamp_ms, manifest_list, summary, schema_id,
+          first_row_id (V3 only).
 ```
 
 ---
@@ -429,7 +602,9 @@ FastAppendAction.commit(table)                      [transaction/append.rs]
 │                     │                         │  ReplacePartitions       │
 ├─────────────────────┼─────────────────────────┼──────────────────────────┤
 │  DELETE / UPDATE /  │  (not available)        │  NOT IMPLEMENTED         │
-│  MERGE (MoR)        │                         │  No RowDelta action      │
+│  MERGE (MoR)        │                         │  EqualityDeleteFileWriter│
+│                     │                         │  exists but no RowDelta  │
+│                     │                         │  action wires its files. │
 ├─────────────────────┼─────────────────────────┼──────────────────────────┤
 │  DELETE / UPDATE /  │  (not available)        │  NOT IMPLEMENTED         │
 │  MERGE (CoW)        │                         │  No OverwriteFiles       │
@@ -438,6 +613,8 @@ FastAppendAction.commit(table)                      [transaction/append.rs]
 │  (RewriteDataFiles) │                         │  No RewriteFiles         │
 ├─────────────────────┼─────────────────────────┼──────────────────────────┤
 │  Properties update  │  UpdatePropertiesAction │  IMPLEMENTED             │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│  Schema update      │  UpdateSchemaAction     │  IMPLEMENTED             │
 ├─────────────────────┼─────────────────────────┼──────────────────────────┤
 │  Sort order update  │  ReplaceSortOrderAction │  IMPLEMENTED             │
 ├─────────────────────┼─────────────────────────┼──────────────────────────┤
@@ -454,28 +631,34 @@ FastAppendAction.commit(table)                      [transaction/append.rs]
 
 ## 4. Key Structs Reference
 
-| Step              | Struct/Trait               | File                                                     | Key Method                             |
-|-------------------|----------------------------|----------------------------------------------------------|----------------------------------------|
-| Writer trait      | `IcebergWriterBuilder`     | iceberg/src/writer/mod.rs                                | `build(partition_key)`                 |
-| Writer trait      | `IcebergWriter`            | iceberg/src/writer/mod.rs                                | `write(batch)`, `close()`              |
-| Parquet builder   | `ParquetWriterBuilder`     | iceberg/src/writer/file_writer/parquet_writer.rs         | `build_v1()`, `build_v2_data()`        |
-| Parquet writer    | `ParquetWriter`            | iceberg/src/writer/file_writer/parquet_writer.rs         | `write()`, `close()`                   |
-| Rolling writer    | `RollingFileWriter`        | iceberg/src/writer/file_writer/rolling_writer.rs         | `write()` with auto-rollover           |
-| Location gen      | `DefaultLocationGenerator` | iceberg/src/writer/file_writer/location_generator.rs     | `generate_location(partition)`         |
-| File name gen     | `DefaultFileNameGenerator` | iceberg/src/writer/file_writer/location_generator.rs     | `generate_file_name()`                 |
-| Data writer       | `DataFileWriter`           | iceberg/src/writer/base_writer/data_file_writer.rs       | `write()`, `close() → Vec<DataFile>`   |
-| Eq delete writer  | `EqualityDeleteFileWriter` | iceberg/src/writer/base_writer/equality_delete_writer.rs | `write()`, `close()`                   |
-| Fanout            | `FanoutWriter`             | iceberg/src/writer/partitioning/fanout_writer.rs         | multi-partition routing                |
-| Clustered         | `ClusteredWriter`          | iceberg/src/writer/partitioning/clustered_writer.rs      | sorted partition switching             |
-| Unpartitioned     | `UnpartitionedWriter`      | iceberg/src/writer/partitioning/unpartitioned_writer.rs  | pass-through                           |
-| Task writer       | `TaskWriter`               | integrations/datafusion/src/task_writer.rs               | `write()`, `close()`                   |
-| Transaction       | `Transaction`              | iceberg/src/transaction/mod.rs                           | `fast_append()`, `commit(catalog)`     |
-| Append action     | `FastAppendAction`         | iceberg/src/transaction/append.rs                        | `add_data_files()`, `commit()`         |
-| Snapshot          | `SnapshotProducer`         | iceberg/src/transaction/snapshot.rs                      | `produce_snapshot()`                   |
-| Manifest writer   | `ManifestWriter`           | iceberg/src/spec/manifest/writer.rs                      | `add_entry()`, `write_manifest_file()` |
-| Manifest list     | `ManifestListWriter`       | iceberg/src/spec/manifest_list.rs                        | writes manifest list Avro              |
-| DataFusion write  | `IcebergTableWrite`        | integrations/datafusion/src/physical_plan/write.rs       | `execute()`                            |
-| DataFusion commit | `IcebergTableCommit`       | integrations/datafusion/src/physical_plan/commit.rs      | `execute()`                            |
+| Step              | Struct/Trait               | File                                                     | Key Method                              |
+|-------------------|----------------------------|----------------------------------------------------------|-----------------------------------------|
+| Logical builder   | `IcebergWriterBuilder`     | iceberg/src/writer/mod.rs                                | `build(partition_key)`                  |
+| Logical writer    | `IcebergWriter`            | iceberg/src/writer/mod.rs                                | `write(batch)`, `close()`               |
+| Physical builder  | `FileWriterBuilder`        | iceberg/src/writer/file_writer/mod.rs                    | `build(output_file)`                    |
+| Physical writer   | `FileWriter`               | iceberg/src/writer/file_writer/mod.rs                    | `write(&batch)`, `close(self)`          |
+| Parquet builder   | `ParquetWriterBuilder`     | iceberg/src/writer/file_writer/parquet_writer.rs         | `new`, `new_with_match_mode`, `build`   |
+| Parquet writer    | `ParquetWriter`            | iceberg/src/writer/file_writer/parquet_writer.rs         | `write`, `close → Vec<DataFileBuilder>` |
+| Rolling builder   | `RollingFileWriterBuilder` | iceberg/src/writer/file_writer/rolling_writer.rs         | `new`, `new_with_default_file_size`, `build` |
+| Rolling writer    | `RollingFileWriter`        | iceberg/src/writer/file_writer/rolling_writer.rs         | `write(&pk, &batch)` with auto-rollover |
+| Location gen      | `DefaultLocationGenerator` | iceberg/src/writer/file_writer/location_generator.rs     | `generate_location(pk, file_name)`      |
+| File name gen     | `DefaultFileNameGenerator` | iceberg/src/writer/file_writer/location_generator.rs     | `generate_file_name()`                  |
+| Data writer       | `DataFileWriter`           | iceberg/src/writer/base_writer/data_file_writer.rs       | `write()`, `close() → Vec<DataFile>`    |
+| Eq delete writer  | `EqualityDeleteFileWriter` | iceberg/src/writer/base_writer/equality_delete_writer.rs | `write()`, `close()`                    |
+| Partition trait   | `PartitioningWriter`       | iceberg/src/writer/partitioning/mod.rs                   | `write(pk, batch)`, `close(self)`       |
+| Fanout            | `FanoutWriter`             | iceberg/src/writer/partitioning/fanout_writer.rs         | multi-partition routing                 |
+| Clustered         | `ClusteredWriter`          | iceberg/src/writer/partitioning/clustered_writer.rs      | sorted partition switching              |
+| Unpartitioned     | `UnpartitionedWriter`      | iceberg/src/writer/partitioning/unpartitioned_writer.rs  | pass-through (no key in `write`)        |
+| Task writer       | `TaskWriter`               | integrations/datafusion/src/task_writer.rs               | `try_new()`, `write()`, `close(self)`   |
+| Transaction       | `Transaction`              | iceberg/src/transaction/mod.rs                           | `fast_append()`, `commit(catalog)`      |
+| Action helper     | `ApplyTransactionAction`   | iceberg/src/transaction/action.rs                        | `apply(tx) → Transaction`               |
+| Append action     | `FastAppendAction`         | iceberg/src/transaction/append.rs                        | `add_data_files()`, `commit()`          |
+| Snapshot          | `SnapshotProducer`         | iceberg/src/transaction/snapshot.rs                      | `commit(op, manifest_process)`          |
+| Manifest builder  | `ManifestWriterBuilder`    | iceberg/src/spec/manifest/writer.rs                      | `build_v1` / `build_v2_data` / `build_v3_data` / `…_deletes` |
+| Manifest writer   | `ManifestWriter`           | iceberg/src/spec/manifest/writer.rs                      | `add_entry`, `add_file`, `write_manifest_file` |
+| Manifest list     | `ManifestListWriter`       | iceberg/src/spec/manifest_list.rs                        | `v1` / `v2` / `v3`, `add_manifests`, `close` |
+| DataFusion write  | `IcebergWriteExec`         | integrations/datafusion/src/physical_plan/write.rs       | `execute()`                             |
+| DataFusion commit | `IcebergCommitExec`        | integrations/datafusion/src/physical_plan/commit.rs      | `execute()`                             |
 
 ---
 
@@ -485,18 +668,32 @@ FastAppendAction.commit(table)                      [transaction/append.rs]
 table-location/
 ├── metadata/
 │   ├── v1.metadata.json
-│   ├── v2.metadata.json               <── new version after commit
-│   ├── snap-123456-0-uuid.avro        <── manifest list
-│   ├── uuid-m0.avro                   <── manifest (new data files, status=ADDED)
-│   └── uuid-m1.avro                   <── manifest (existing files, carried over)
+│   ├── v2.metadata.json                              <── new version after commit
+│   ├── snap-<snapshot_id>-0-<commit_uuid>.avro       <── new manifest list
+│   │                                                    (references the new manifest below
+│   │                                                     plus parent-snapshot manifests by path)
+│   ├── <commit_uuid>-m0.avro                         <── new manifest (added data files, status=ADDED)
+│   └── <prev_commit_uuid>-m0.avro                    <── pre-existing manifests are NOT rewritten;
+│                                                        fast append references them in-place
+│                                                        from the new manifest list
 │
 └── data/
-    ├── date=2024-01-01/
-    │   ├── 00000-0-uuid.parquet       <── new data file
-    │   └── 00001-0-uuid.parquet       <── new data file (rolled)
-    └── date=2024-01-02/
-        └── 00000-0-uuid.parquet       <── new data file
+    ├── region=US/
+    │   ├── <writer_uuid>-00000.parquet               <── new data file
+    │   └── <writer_uuid>-00001.parquet               <── new data file (rolled)
+    └── region=EU/
+        └── <writer_uuid>-00000.parquet               <── new data file
 ```
+
+Fast append writes exactly one new manifest per commit (for the added data
+files); manifests from prior snapshots are not copied or rewritten — they are
+carried forward into the new manifest list by their existing paths (see
+`FastAppendOperation::existing_manifest` in `transaction/append.rs`).
+
+Data file names follow `{prefix}-{file_count:05}[-{suffix}].{format}` from
+`DefaultFileNameGenerator`. The DataFusion integration uses
+`Uuid::now_v7().to_string()` as the prefix for each writer instance, giving
+files like `01900b34-7e0e-7e6b-a26d-2ca345b9d3c1-00000.parquet`.
 
 ---
 
@@ -510,8 +707,8 @@ User code / DataFusion
 ┌──────────────────────┐
 │  TaskWriter          │    (DataFusion integration layer)
 │  ┌────────────────┐  │
-│  │ Partition-     │  │    Splits by partition key
-│  │ Splitter       │  │
+│  │ RecordBatch-   │  │    Splits by partition key
+│  │ PartitionSplit │  │    (only for partitioned tables)
 │  └───────┬────────┘  │
 │          V           │
 │  ┌────────────────┐  │
@@ -523,12 +720,12 @@ User code / DataFusion
 ┌──────────────────────┐
 │  DataFileWriter      │    (base writer: sets content type, partition)
 │  ┌────────────────┐  │
-│  │ Rolling-       │  │    Rolls to new file at target size
-│  │ FileWriter     │  │
+│  │ Rolling-       │  │    Rolls to new file when
+│  │ FileWriter     │  │    current_written_size() > target
 │  │ ┌────────────┐ │  │
 │  │ │ Parquet-   │ │  │    Physical Parquet writing
-│  │ │ Writer     │ │  │
-│  │ └────────────┘ │  │
+│  │ │ Writer     │ │  │    (built per file from
+│  │ └────────────┘ │  │     ParquetWriterBuilder)
 │  └────────────────┘  │
 └──────────────────────┘
            │
