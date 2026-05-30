@@ -15,7 +15,11 @@ The following are missing:
 - No `RowDelta` transaction action (needed for MoR UPDATE/MERGE)
 - No position delete file writing (needed for MoR)
 - No DataFusion integration for row-level DML operations
-- No conflict detection / isolation level support
+- No row-level conflict validation or `SERIALIZABLE`/`SNAPSHOT` isolation
+  level support (the catalog already enforces optimistic
+  `UuidMatch` / `RefSnapshotIdMatch` requirements as retryable
+  `CatalogCommitConflicts` — what's missing is UPDATE/MERGE-specific
+  validation of scanned/affected files and partitions)
 
 ---
 
@@ -26,23 +30,24 @@ While UPDATE/MERGE are not implemented, the Rust codebase has building blocks th
 ### 2.1 Transaction Framework
 
 ```
-Transaction                                         [iceberg/src/transaction/mod.rs]
+Transaction                                         [crates/iceberg/src/transaction/mod.rs]
   │
   ├─> Holds a Table and a list of BoxedTransactionAction
-  ├─> commit(catalog) with retry + exponential backoff
+  ├─> commit(catalog) with retry + exponential backoff (via `backon`)
   │
   └─> Available actions:
-        ├── FastAppendAction          add new data files (append-only)
-        ├── UpdatePropertiesAction    modify table properties
+        ├── FastAppendAction            add new data files (append-only)
+        ├── UpdatePropertiesAction      modify table properties
         ├── UpgradeFormatVersionAction  V1 → V2 → V3
-        ├── UpdateStatisticsAction    update stats files
-        ├── UpdateLocationAction      change table location
-        └── ReplaceSortOrderAction    change sort order
+        ├── UpdateStatisticsAction      update stats files
+        ├── UpdateLocationAction        change table location
+        ├── ReplaceSortOrderAction      change sort order
+        └── UpdateSchemaAction          add/delete columns (top-level / nested)
 
   Missing actions for UPDATE/MERGE:
-        ├── OverwriteFilesAction      delete old + add new files (CoW)
-        ├── RowDeltaAction            add data + delete files atomically (MoR)
-        └── RewriteFilesAction        swap files for compaction
+        ├── OverwriteFilesAction        delete old + add new files (CoW)
+        ├── RowDeltaAction              add data + delete files atomically (MoR)
+        └── RewriteFilesAction          swap files for compaction
 ```
 
 ### 2.2 Delete File Infrastructure (Read-Side)
@@ -50,45 +55,66 @@ Transaction                                         [iceberg/src/transaction/mod
 ```
 The read path can already apply delete files during scans:
 
-DeleteFileIndex                                     [iceberg/src/delete_file_index.rs]
+DeleteFileIndex                                     [crates/iceberg/src/delete_file_index.rs]
   └─> Associates delete files with data files during planning
 
-DeleteFilter                                        [iceberg/src/arrow/delete_filter.rs]
+DeleteFilter                                        [crates/iceberg/src/arrow/delete_filter.rs]
   └─> Applies position deletes + equality deletes during reading
 
-DeleteVector                                        [iceberg/src/delete_vector.rs]
+DeleteVector                                        [crates/iceberg/src/delete_vector.rs]
   └─> RoaringTreemap bitmap for position delete tracking
 
-CachingDeleteFileLoader                             [iceberg/src/arrow/caching_delete_file_loader.rs]
+CachingDeleteFileLoader                             [crates/iceberg/src/arrow/caching_delete_file_loader.rs]
   └─> Loads and caches delete files
 
-This means: If position delete files or DVs were written by another system
-(e.g., Java Spark), the Rust reader would correctly apply them.
+This means: If Parquet position deletes or equality delete files were
+written by another system (e.g., Java Spark), the Rust reader would
+correctly apply them. Puffin-format deletion vectors (V3) are NOT yet
+loaded — `CachingDeleteFileLoader` has an explicit TODO for the
+"Delete Vector loader from Puffin files" path.
 ```
 
 ### 2.3 Equality Delete Writer
 
 ```
-EqualityDeleteFileWriter                            [iceberg/src/writer/base_writer/equality_delete_writer.rs]
+EqualityDeleteFileWriter                            [crates/iceberg/src/writer/base_writer/equality_delete_writer.rs]
   │
-  └─> Can write equality delete files (Parquet format)
-      with field validation (no floats, no nested types)
+  └─> Can write equality delete files (Parquet format).
+      Equality-id field validation rejects nested and floating-point
+      types, but the spec's "no nullable" rule for identifier fields
+      is NOT yet enforced here.
 
   This is the only delete write capability currently available.
+  (The base_writer module docs still mention `PositionDeleteFileWriter`,
+   but only `data_file_writer` and `equality_delete_writer` are exposed.)
 ```
 
 ### 2.4 DataFusion Integration
 
 ```
-IcebergTableProvider                                [integrations/datafusion/src/table/mod.rs]
+IcebergTableProvider                                [crates/integrations/datafusion/src/table/mod.rs]
   │
-  ├─> scan() → IcebergTableScan          read operations (IMPLEMENTED)
-  ├─> insert_into() → IcebergWriteExec    append operations (IMPLEMENTED)
+  ├─> scan() → IcebergTableScan                       read operations (IMPLEMENTED)
+  ├─> insert_into(state, input, InsertOp) → IcebergCommitExec
+  │                                                   append operations (IMPLEMENTED)
+  │     The `InsertOp` argument is currently ignored (parameter is
+  │     `_insert_op`) — only the append path is wired up;
+  │     `Overwrite` and `Replace` semantics are not supported.
+  │     The returned plan is `IcebergCommitExec` wrapping a
+  │     `CoalescePartitionsExec` over `IcebergWriteExec`.
   │
   └─> Row-level operations (UPDATE, DELETE, MERGE):
         NOT IMPLEMENTED
-        DataFusion does not yet have a full row-level DML framework
-        equivalent to Spark's SupportsDeleteV2 / SupportsRowLevelOperations
+        DataFusion 53.1.0's `TableProvider` exposes `update(...)` and
+        `delete_from(...)` hooks that the physical planner can dispatch
+        to, but `IcebergTableProvider` does not override them, so
+        UPDATE and DELETE fall back to DataFusion's default
+        "unsupported" error.
+        MERGE INTO is not yet exposed via `TableProvider` in
+        DataFusion 53.1.0 and remains unsupported.
+        A Spark-style row-level DML framework (e.g. SupportsDeleteV2 /
+        SupportsRowLevelOperations) would still need to be built on
+        top of these hooks for full CoW/MoR semantics.
 ```
 
 ---
@@ -223,7 +249,11 @@ OverwriteFilesAction                                (hypothetical)
           SetSnapshotRef(main → new_snapshot),
         ]
         requirements: [
-          AssertCurrentSnapshotId(current),
+          TableRequirement::UuidMatch { uuid },
+          TableRequirement::RefSnapshotIdMatch {
+            ref: "main",
+            snapshot_id: current,
+          },
         ]
 ```
 
@@ -270,12 +300,18 @@ DeletionVectorWriter                                (hypothetical)
   │
   ├─> Merge with previous DVs (if updating existing DV)
   │
-  └─> Write Puffin file:
-        PuffinWriter
-          .add_blob(type="apache-datasketches-theta-v1",
-                    metadata={"referenced-data-file": path},
-                    payload=bitmap.serialize())
-        Return DataFile with content=PositionDeletes, format=Puffin
+  └─> Write Puffin file (PuffinWriter already exists in
+        crates/iceberg/src/puffin/writer.rs). Current API:
+        PuffinWriter::add(blob, compression_codec)
+          where blob is a `Blob` with
+            type=DELETION_VECTOR_V1,
+            properties={"referenced-data-file": path},
+            data=bitmap.serialize().
+        Return DataFile with content=PositionDeletes, format=Puffin.
+
+  The Puffin blob types `DELETION_VECTOR_V1` and
+  `APACHE_DATASKETCHES_THETA_V1` are defined in
+  crates/iceberg/src/puffin/blob.rs.
 ```
 
 ### 5.5 DataFusion DML Integration
@@ -304,18 +340,35 @@ For full UPDATE/MERGE support in DataFusion:
 The Rust implementation has metadata column support that would be needed for UPDATE/MERGE:
 
 ```
-Metadata columns defined in:                        [iceberg/src/metadata_columns.rs]
+Metadata columns defined in:                        [crates/iceberg/src/metadata_columns.rs]
 
-| Column             | Type    | Purpose                               | Rust Status |
-|--------------------|---------|---------------------------------------|-------------|
-| _file              | string  | Data file path for row identification | Defined     |
-| _pos               | long    | 0-based row position within file      | Defined     |
-| _spec_id           | int     | Partition spec version for routing    | Defined     |
-| _partition         | struct  | Partition values for routing          | Defined     |
-| _row_id            | long    | Row lineage identity (V3)             | Not defined |
-| _last_updated_seq  | long    | Last modification tracking (V3)       | Not defined |
-| _is_deleted        | boolean | Delete marking for changelogs         | Not defined |
+| Column                          | Type    | Purpose                                 | Rust Status |
+|---------------------------------|---------|-----------------------------------------|-------------|
+| _file                           | string  | Data file path for row identification   | Defined     |
+| _pos                            | long    | 0-based row position within file        | Defined     |
+| _deleted                        | boolean | Delete marking for changelogs           | Defined     |
+| _spec_id                        | int     | Partition spec version for routing      | Defined     |
+| _partition                      | struct  | Partition values for routing            | Defined     |
+| _change_type                    | string  | INSERT/DELETE/UPDATE_BEFORE/_AFTER tag  | Defined     |
+| _change_ordinal                 | int     | Order of the change in a changelog      | Defined     |
+| _commit_snapshot_id             | long    | Snapshot ID in which the change occurred| Defined     |
+| _row_id                         | long    | Row lineage identity (V3)               | Defined     |
+| _last_updated_sequence_number   | long    | Last modification tracking (V3)         | Defined     |
 ```
+
+The field-ID constants, name constants, and lookup helpers
+(`get_metadata_field`, `get_metadata_field_id`, `is_metadata_field`,
+`is_metadata_column_name`) are all in place. Wiring these columns into a
+row-level DML execution path (scan-side projection, write-side routing,
+delta decomposition) is the missing piece, not the field definitions
+themselves.
+
+The Rust write path also already tracks V3 row lineage at commit time:
+`SnapshotProducer` assigns `first_row_id` from `TableMetadata.next_row_id()`
+and propagates per-manifest `first_row_id` in the manifest list (see
+`crates/iceberg/src/transaction/snapshot.rs`). That means appends produced
+by the Rust writer are V3-lineage-correct; the gap is on the DML side, not
+in row-id assignment.
 
 ---
 
@@ -350,9 +403,23 @@ Concurrent Operation Scenarios (Java behavior):
 FAILS = commit rejected, retried with exponential backoff
 SUCCEEDS = commits proceed without conflict
 
-Rust status: NOT IMPLEMENTED
-  The Transaction.commit() has basic retry with backoff,
-  but no conflict detection or isolation level support.
+Rust status: PARTIAL
+  Optimistic commit conflict detection IS in place:
+    - Snapshot-producing actions emit
+      `TableRequirement::UuidMatch` and
+      `TableRequirement::RefSnapshotIdMatch`
+      (see crates/iceberg/src/transaction/snapshot.rs).
+    - The catalog enforces these as retryable
+      `CatalogCommitConflicts` errors
+      (see crates/iceberg/src/catalog/mod.rs), and
+      Transaction.commit() retries with exponential backoff
+      (via `backon`).
+  What is NOT yet implemented:
+    - Row-level UPDATE/MERGE conflict validation
+      (e.g., validate scanned data/delete files, validate
+      no conflicting partition data/deletes).
+    - Explicit `SERIALIZABLE` vs `SNAPSHOT` isolation modes
+      and the per-isolation behavior table above.
 ```
 
 ---
@@ -379,12 +446,16 @@ Rust status: NOT IMPLEMENTED
 | `Transaction`                          | Transaction with actions            | `Transaction`                          | Exists          |
 | `TransactionAction` (trait)            | Pluggable actions                   | `TransactionAction` (trait)            | Exists          |
 | `FastAppendAction`                     | Append data files                   | `FastAppendAction`                     | Exists          |
+| `UpdateSchemaAction` (add/delete col)  | Schema evolution                    | `UpdateSchemaAction`                   | Exists (partial — add + delete) |
 | `SnapshotProducer`                     | Snapshot creation                   | `SnapshotProducer`                     | Exists          |
 | `DeleteFileIndex`                      | Delete file lookup                  | `DeleteFileIndex`                      | Exists          |
 | `DeleteFilter`                         | Delete application during reads     | `DeleteFilter`                         | Exists          |
 | `PositionDeleteIndex` (bitmap)         | Position delete bitmap              | `DeleteVector` (RoaringTreemap)        | Exists          |
 | `EqualityDeleteWriter`                 | Equality delete file writing        | `EqualityDeleteFileWriter`             | Exists          |
-| `MetadataColumns`                      | _file, _pos, _spec_id, etc.         | `metadata_columns`                     | Partial         |
+| `MetadataColumns`                      | _file, _pos, _spec_id, etc.         | `metadata_columns`                     | Exists (definitions only — not yet projected/routed in DML) |
+| `FanoutPositionOnlyWriter` (data side) | Unsorted partition fan-out          | `FanoutWriter`                         | Exists (data only) |
+| `ClusteredDataWriter`                  | Sorted partition writer             | `ClusteredWriter`                      | Exists (data only) |
+| `UnpartitionedWriter` (data side)      | Unpartitioned table writer          | `UnpartitionedWriter`                  | Exists (data only) |
 | `TableProperties` (mode config)        | write.update.mode, etc.             | (not used for mode dispatch)           | Not applicable  |
 
 ---
