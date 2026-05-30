@@ -65,14 +65,16 @@ This document provides a high-level architecture overview of the Apache Iceberg 
 │   ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐    │
 │   │ OpenDAL      │  │ LocalFs      │  │ Memory                 │    │
 │   │ (S3, GCS,    │  │ Storage      │  │ Storage                │    │
-│   │  ADLS, etc.) │  │              │  │ (testing)              │    │
+│   │  Azure DLS,  │  │              │  │ (testing)              │    │
+│   │  OSS, HF)    │  │              │  │                        │    │
 │   └──────────────┘  └──────────────┘  └────────────────────────┘    │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
              │
 ┌────────────V────────────────────────────────────────────────────────┐
 │                        CLOUD STORAGE                                │
-│    S3  |  GCS  |  ADLS  |  HDFS  |  Local FS                        │
+│    S3  |  GCS  |  Azure DLS  |  Aliyun OSS  |  Hugging Face  |      │
+│    Local FS  |  Memory                                              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -86,19 +88,26 @@ iceberg-rust/
 │   ├── iceberg/                    Core library — types, specs, readers, writers, transforms
 │   │   └── src/
 │   │       ├── catalog/            Catalog trait + MemoryCatalog
-│   │       ├── io/                 FileIO, Storage trait, InputFile, OutputFile
+│   │       ├── io/                 FileIO, Storage trait, InputFile, OutputFile, ObjectCache (concrete manifest/manifest-list cache in io/object_cache.rs)
 │   │       ├── spec/               Iceberg spec types (Schema, Snapshot, Manifest, DataFile...)
-│   │       ├── scan/               TableScan, FileScanTask, PlanContext
-│   │       ├── writer/             IcebergWriter, DataFileWriter, Parquet writer, partitioning
-│   │       ├── transaction/        Transaction, FastAppendAction, SnapshotProducer
-│   │       ├── arrow/              ArrowReader, DeleteFilter, RecordBatchTransformer
+│   │       ├── scan/               TableScan, FileScanTask, PlanContext, scan caches
+│   │       ├── writer/             IcebergWriter trait + base_writer/, file_writer/, partitioning/ subtrees
+│   │       ├── transaction/        Transaction, FastAppendAction, SnapshotProducer, schema/properties/location/sort/stats/upgrade actions
+│   │       ├── arrow/              ArrowReader, DeleteFilter, RecordBatchTransformer, partition splitter/value calc, scan metrics
 │   │       ├── expr/               Expressions, predicates, evaluator visitors
 │   │       ├── transform/          Partition transforms (identity, bucket, truncate, etc.)
-│   │       ├── puffin/             Puffin file format (for statistics / deletion vectors)
-│   │       ├── inspect/            Metadata inspection utilities
+│   │       ├── puffin/             Puffin file format (statistics / deletion-vector blobs)
+│   │       ├── encryption/         Envelope encryption (KMS manager, AES-GCM/CTR streams)
+│   │       ├── inspect/            Metadata inspection utilities (snapshots, manifests, metadata_table)
+│   │       ├── avro/               Avro schema helpers (manifest serialization)
+│   │       ├── runtime/            Tokio runtime abstraction used by Catalog/Table
+│   │       ├── util/               Misc helpers (snapshot lookup helpers, etc.)
+│   │       ├── cache.rs               ObjectCache<K,V> / ObjectCacheProvide pluggable cache traits (implemented by iceberg-cache-moka)
+│   │       ├── compression.rs         Compression codec helpers
 │   │       ├── delete_file_index.rs   Index of delete files for scan planning
 │   │       ├── delete_vector.rs       RoaringTreemap-based position delete bitmap
 │   │       ├── metadata_columns.rs    Metadata column definitions (_file, _pos, etc.)
+│   │       ├── test_utils.rs          Public test helpers
 │   │       └── table.rs               Table abstraction
 │   │
 │   ├── catalog/
@@ -110,14 +119,17 @@ iceberg-rust/
 │   │   └── loader/                 Unified catalog loader (dynamic dispatch)
 │   │
 │   ├── storage/
-│   │   └── opendal/                OpenDAL storage backend (S3, GCS, ADLS, HDFS, etc.)
+│   │   └── opendal/                OpenDAL storage backend (services: memory, fs, s3, gcs, oss, azdls, hf)
 │   │
 │   ├── integrations/
 │   │   ├── datafusion/             DataFusion query engine integration
 │   │   │   └── src/
-│   │   │       ├── physical_plan/  IcebergTableScan, IcebergWriteExec, IcebergCommitExec
-│   │   │       ├── task_writer.rs  High-level writer with partition dispatch
-│   │   │       └── ...             Table provider, catalog provider
+│   │   │       ├── catalog.rs      IcebergCatalogProvider / IcebergSchemaProvider
+│   │   │       ├── table/          IcebergTableProvider, IcebergStaticTableProvider, IcebergTableProviderFactory, metadata table provider
+│   │   │       ├── physical_plan/  IcebergTableScan (pub) + IcebergWriteExec, IcebergCommitExec, IcebergMetadataScan, project/repartition/sort helpers (pub(crate))
+│   │   │       ├── task_writer.rs  High-level writer with partition dispatch (Unpartitioned / Fanout / Clustered)
+│   │   │       ├── schema.rs       Arrow ↔ Iceberg schema conversion
+│   │   │       └── error.rs        Error mapping into DataFusion errors
 │   │   ├── cache-moka/             Moka-based metadata caching layer
 │   │   └── playground/             Playground for exploration
 │   │
@@ -127,7 +139,7 @@ iceberg-rust/
 │   └── examples/                   Example applications
 │
 ├── bindings/
-│   └── python/                     Python bindings (excluded from workspace, separate build)
+│   └── python/                     Python bindings (workspace member; wheel built via maturin / pyproject.toml)
 │
 ├── Cargo.toml                      Workspace manifest
 ├── Cargo.lock                      Committed for reproducible builds
@@ -219,9 +231,9 @@ Rust types (crates/iceberg/src/spec/):
   Snapshot           → snapshot.rs
   ManifestList       → manifest_list.rs
   ManifestFile       → manifest_list.rs (ManifestFile struct)
-  ManifestEntry      → manifest/mod.rs
+  ManifestEntry      → manifest/entry.rs
   DataFile           → manifest/data_file.rs
-  Schema             → schema.rs
+  Schema             → schema/mod.rs
   PartitionSpec      → partition.rs
   SortOrder          → sort.rs
 ```
@@ -237,11 +249,18 @@ Rust types (crates/iceberg/src/spec/):
                         │                     │
                         │ list_namespaces()   │
                         │ create_namespace()  │
+                        │ get_namespace()     │
+                        │ namespace_exists()  │
+                        │ update_namespace()  │
+                        │ drop_namespace()    │
                         │ list_tables()       │
                         │ create_table()      │
                         │ load_table()      ──┼──> returns Table
                         │ drop_table()        │
+                        │ purge_table()       │   <── drop + delete data files
+                        │ table_exists()      │
                         │ rename_table()      │
+                        │ register_table()    │
                         │ update_table()      │   <── atomic commit via TableCommit
                         └────────┬────────────┘
                                  │ returns
@@ -278,12 +297,21 @@ Rust types (crates/iceberg/src/spec/):
                     │  WRITE SIDE           │
                     │                       │
                     │  IcebergWriterBuilder │   crates/iceberg/src/writer/mod.rs
-                    │    build()          ──┼──> IcebergWriter
+                    │    build(part_key) ───┼──> IcebergWriter
                     │                       │
                     │  IcebergWriter        │
-                    │    write(RecordBatch) │
-                    │    close()          ──┼──> Vec<DataFile>
+                    │    write(I)           │   I = RecordBatch by default
+                    │    close()          ──┼──> Vec<DataFile> (O)
                     │                       │
+                    │  Implementations:     │
+                    │   DataFileWriter      │   base_writer/data_file_writer.rs
+                    │   EqualityDelete-     │   base_writer/equality_delete_writer.rs
+                    │     FileWriter        │
+                    │   RollingFileWriter   │   file_writer/rolling_writer.rs
+                    │   ParquetWriter       │   file_writer/parquet_writer.rs
+                    │   ClusteredWriter     │   partitioning/clustered_writer.rs
+                    │   FanoutWriter        │   partitioning/fanout_writer.rs
+                    │   UnpartitionedWriter │   partitioning/unpartitioned_writer.rs
                     └──────────┬────────────┘
                                │
                     ┌──────────V────────────┐
@@ -292,8 +320,14 @@ Rust types (crates/iceberg/src/spec/):
                     │  fast_append()      ──┼──> FastAppendAction
                     │  update_table_        │
                     │    properties()       │
+                    │  update_schema()      │
+                    │  update_location()    │
+                    │  update_statistics()  │
                     │  replace_sort_order() │
-                    │  commit(catalog)    ──┼──> atomic metadata update
+                    │  upgrade_table_       │
+                    │    version()          │
+                    │  commit(catalog)    ──┼──> atomic metadata update (retries
+                    │                       │     with exponential backoff via `backon`)
                     └───────────────────────┘
 
 
@@ -302,11 +336,14 @@ Rust types (crates/iceberg/src/spec/):
                     │  #[typetag::serde]    │
                     │                       │
                     │  exists(path)         │
+                    │  metadata(path)       │
                     │  read(path)           │
-                    │  write(path, bytes)   │
                     │  reader(path)       ──┼──> Box<dyn FileRead>
+                    │  write(path, bytes)   │
                     │  writer(path)       ──┼──> Box<dyn FileWrite>
                     │  delete(path)         │
+                    │  delete_prefix(path)  │
+                    │  delete_stream(paths) │
                     │  new_input(path)    ──┼──> InputFile
                     │  new_output(path)   ──┼──> OutputFile
                     └───────────────────────┘
@@ -361,6 +398,7 @@ Rust types (crates/iceberg/src/spec/):
 │  ├── create_table(namespace, creation) → Table                   │
 │  ├── load_table(table) → Table                                   │
 │  ├── drop_table(table)                                           │
+│  ├── purge_table(table)                                          │
 │  ├── table_exists(table) → bool                                  │
 │  ├── rename_table(src, dest)                                     │
 │  ├── register_table(table, metadata_location) → Table            │
@@ -369,6 +407,7 @@ Rust types (crates/iceberg/src/spec/):
 │  pub trait CatalogBuilder: Default + Debug + Send + Sync         │
 │  ├── type C: Catalog                                             │
 │  ├── with_storage_factory(factory) → Self                        │
+│  ├── with_runtime(runtime) → Self                                │
 │  └── load(name, props) → Result<Self::C>                         │
 │                                                                  │
 └──────────────┬───────────────────────────────────────────────────┘
@@ -435,7 +474,8 @@ Rust types (crates/iceberg/src/spec/):
             │                               │
   ┌─────────V──────────┐         ┌──────────V───────────┐
   │ IcebergTableScan   │         │ IcebergWriteExec      │
-  │ (ExecutionPlan)    │         │ (ExecutionPlan)       │
+  │ (ExecutionPlan,    │         │ (ExecutionPlan,       │
+  │  pub)              │         │  pub(crate))          │
   │                    │         │                       │
   │ execute():         │         │ execute():            │
   │  Table.scan()      │         │  TaskWriter           │
@@ -446,13 +486,14 @@ Rust types (crates/iceberg/src/spec/):
   │    Stream          │                    │
   └────────────────────┘         ┌──────────V────────────┐
                                  │ IcebergCommitExec     │
-                                 │ (ExecutionPlan)       │
+                                 │ (ExecutionPlan,       │
+                                 │  pub(crate))          │
                                  │                       │
                                  │ execute():            │
                                  │  Transaction          │
                                  │  → fast_append()      │
                                  │  → commit(catalog)    │
-                                 └──────────────────────-┘
+                                 └───────────────────────┘
 
   TaskWriter (crates/integrations/datafusion/src/task_writer.rs):
   ┌──────────────────────────────────────────┐
@@ -478,7 +519,7 @@ Rust types (crates/iceberg/src/spec/):
                     ┌───────────────────────┐
                     │  Iceberg Core Layer   │
                     │                       │
-                    │  ArrowReader          │  (arrow/reader.rs)
+                    │  ArrowReader          │  (arrow/reader/)
                     │  ArrowReaderBuilder   │  Parquet → Arrow RecordBatch
                     │                       │
                     │  ParquetWriter        │  (writer/file_writer/parquet_writer.rs)
@@ -524,9 +565,9 @@ Note: Unlike Java Iceberg, the Rust implementation:
 | **Catalogs**              | REST, Hive, JDBC, Hadoop, Glue, Nessie               | REST, HMS, SQL, Glue, S3Tables + CatalogLoader              |
 | **Data file formats**     | Parquet, ORC, Avro                                   | Parquet only                                                |
 | **In-memory format**      | InternalRow (Spark), RowData (Flink)                 | Arrow RecordBatch (native)                                  |
-| **Storage backends**      | S3FileIO, GCSFileIO, ADLSFileIO, HadoopFileIO        | OpenDAL (S3, GCS, ADLS, HDFS, etc.), LocalFs, Memory        |
-| **Write operations**      | AppendFiles, OverwriteFiles, RewriteFiles, RowDelta  | FastAppend only                                             |
-| **Delete strategies**     | CoW + MoR (position deletes, equality deletes, DVs)  | MoR read support (position + equality deletes + DV read)    |
+| **Storage backends**      | S3FileIO, GCSFileIO, ADLSFileIO, HadoopFileIO        | OpenDAL (S3, GCS, Azure DLS, Aliyun OSS, Hugging Face), LocalFs, Memory (no HDFS) |
+| **Write operations**      | AppendFiles, OverwriteFiles, RewriteFiles, RowDelta  | FastAppend (data-file appends); metadata-only actions: UpdateSchema, UpdateProperties, UpdateLocation, UpdateStatistics, ReplaceSortOrder, UpgradeFormatVersion |
+| **Delete strategies**     | CoW + MoR (position deletes, equality deletes, DVs)  | MoR read for Parquet position + equality deletes; Puffin DV blob reader TODO; equality delete writer only |
 | **Compaction**            | RewriteDataFiles (BinPack, Sort, ZOrder)             | Not yet implemented                                         |
 | **UPDATE / MERGE**        | CoW + MoR via Spark                                  | Not yet implemented                                         |
 | **Manifest format**       | Avro                                                 | Avro                                                        |
